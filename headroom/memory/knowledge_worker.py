@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections import Counter, defaultdict, deque
+from functools import lru_cache
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -144,6 +145,7 @@ async def build_knowledge_worker_graph(
 
     nodes: dict[str, dict[str, Any]] = {}
     edges: list[dict[str, Any]] = []
+    seen_edges: set[tuple[Any, Any, Any, Any]] = set()
     entity_id_to_kw: dict[str, str] = {}
     entity_name_to_kw: dict[tuple[str, str], str] = {}
 
@@ -162,24 +164,16 @@ async def build_knowledge_worker_graph(
         )
 
     def add_edge(record: dict[str, Any]) -> None:
-        key = (
-            record.get("src"),
-            record.get("dst"),
-            record.get("type"),
-            record.get("source_id"),
-        )
-        if any(
-            (
-                edge.get("src"),
-                edge.get("dst"),
-                edge.get("type"),
-                edge.get("source_id"),
-            )
-            == key
-            for edge in edges
-        ):
-            return
         if record.get("src") in nodes and record.get("dst") in nodes:
+            key = (
+                record.get("src"),
+                record.get("dst"),
+                record.get("type"),
+                record.get("source_id"),
+            )
+            if key in seen_edges:
+                return
+            seen_edges.add(key)
             edges.append(record)
 
     for memory in memories:
@@ -188,6 +182,7 @@ async def build_knowledge_worker_graph(
         excerpt = _memory_excerpt(memory)
         source_text = _memory_source_text(memory)
         claim_id = _memory_claim_node_id(memory)
+        created_iso = _iso(memory.created_at)
 
         add_node(
             {
@@ -368,8 +363,12 @@ def build_context_snapshot(graph: dict[str, Any], *, max_ideas: int = 20) -> str
     for edge in edges:
         incoming[str(edge.get("dst", ""))].append(edge)
 
+    by_type_index: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for node in nodes.values():
+        by_type_index[node.get("type")].append(node)
+
     def by_type(node_type: str) -> list[dict[str, Any]]:
-        return [node for node in nodes.values() if node.get("type") == node_type]
+        return by_type_index.get(node_type, [])
 
     def marker(confidence: str | None) -> str:
         if confidence == "low":
@@ -769,32 +768,36 @@ def _components(
 ) -> list[list[str]]:
     remaining = set(node_ids)
     components: list[list[str]] = []
-    while remaining:
-        start = min(remaining)
+    for start in sorted(node_ids):
+        if start not in remaining:
+            continue
+        remaining.discard(start)
         queue = deque([start])
-        remaining.remove(start)
         component: list[str] = []
         while queue:
             current = queue.popleft()
             component.append(current)
-            for neighbor in sorted(adjacency[current]):
+            for neighbor in adjacency[current]:
                 if neighbor in remaining:
-                    remaining.remove(neighbor)
+                    remaining.discard(neighbor)
                     queue.append(neighbor)
         components.append(sorted(component))
     return components
 
 
+@lru_cache(maxsize=8192)
 def _slug(value: str) -> str:
     slugged = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return slugged or "item"
 
 
+@lru_cache(maxsize=8192)
 def _stable_suffix(value: str) -> str:
     cleaned = _slug(value)
     return cleaned[:32] if cleaned else _short_hash(value)
 
 
+@lru_cache(maxsize=8192)
 def _short_hash(value: str) -> str:
     return hashlib.sha1(value.encode("utf-8")).hexdigest()[:10]
 
